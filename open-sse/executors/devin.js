@@ -81,6 +81,7 @@ export function buildDevinChatRequest({ model, body = {}, apiKey, userJwt, sessi
     .flatMap(messageForWire)
     .map((item, index) => message(3, encodePrompt(item, `${sessionId}-${index}`)));
   const tools = (Array.isArray(body.tools) ? body.tools : []).map(encodeTool);
+  const toolChoice = encodeToolChoice(body.tool_choice);
   return Buffer.concat([
     message(1, encodeMetadata(normalizeDevinSessionToken(apiKey), userJwt)),
     systemText(body),
@@ -88,7 +89,9 @@ export function buildDevinChatRequest({ model, body = {}, apiKey, userJwt, sessi
     varintField(7, 5n),
     message(8, encodeConfiguration(body)),
     ...tools.map((tool) => message(10, tool)),
-    varintField(11, 1n),
+    // Field 11 disables parallel tool calls; only send it when the client asks.
+    body.parallel_tool_calls === false ? varintField(11, 1n) : Buffer.alloc(0),
+    toolChoice ? message(12, toolChoice) : Buffer.alloc(0),
     stringField(16, sessionId),
     stringField(17, crypto.randomUUID()),
     varintField(20, 1n),
@@ -119,7 +122,7 @@ function systemText(body) {
   const text = typeof body.system === "string"
     ? body.system
     : Array.isArray(body.messages)
-      ? body.messages.filter((item) => item?.role === "system").map((item) => contentText(item.content)).join("\n")
+      ? body.messages.filter((item) => item?.role === "system" || item?.role === "developer").map((item) => contentText(item.content)).join("\n")
       : "";
   return text ? stringField(2, text) : Buffer.alloc(0);
 }
@@ -140,14 +143,19 @@ function encodeConfiguration(body) {
   ]);
 }
 
+// GetChatMessage prompt sources: 1 = user, 2 = assistant, 4 = tool result.
+const SOURCE_USER = 1;
+const SOURCE_ASSISTANT = 2;
+const SOURCE_TOOL = 4;
+
 function messageForWire(item) {
-  if (item?.role === "system") return [];
-  if (item?.role === "user") return [{ role: 1, text: contentText(item.content) }];
-  if (item?.role === "tool") return [{ role: 4, text: contentText(item.content), toolCallId: item.tool_call_id }];
+  if (item?.role === "system" || item?.role === "developer") return [];
+  if (item?.role === "user") return [{ role: SOURCE_USER, text: contentText(item.content) }];
+  if (item?.role === "tool") return [{ role: SOURCE_TOOL, text: contentText(item.content), toolCallId: item.tool_call_id }];
   if (item?.role === "assistant" && Array.isArray(item.tool_calls)) {
     return [{
-      role: 1,
-      text: "",
+      role: SOURCE_ASSISTANT,
+      text: contentText(item.content),
       toolCalls: item.tool_calls.map((call) => ({
         id: call.id,
         name: call.function?.name || call.name || "tool",
@@ -155,18 +163,19 @@ function messageForWire(item) {
       })),
     }];
   }
+  const role = item?.role === "assistant" ? SOURCE_ASSISTANT : SOURCE_USER;
   const output = [];
   for (const content of Array.isArray(item?.content) ? item.content : [{ type: "text", text: contentText(item?.content) }]) {
-    if (content?.type === "text") output.push({ role: 1, text: content.text });
-    else if (content?.type === "thinking") output.push({ role: 1, text: content.thinking });
-    else if (content?.type === "tool_use") output.push({ role: 1, text: "", toolCalls: [{ id: content.id, name: content.name, argumentsJson: JSON.stringify(content.input ?? {}) }] });
+    if (content?.type === "text") output.push({ role, text: content.text });
+    else if (content?.type === "thinking") output.push({ role, text: content.thinking });
+    else if (content?.type === "tool_use") output.push({ role, text: "", toolCalls: [{ id: content.id, name: content.name, argumentsJson: JSON.stringify(content.input ?? {}) }] });
   }
   return output;
 }
 
 function encodePrompt(item, id) {
   return Buffer.concat([
-    stringField(1, id),
+    stringField(1, item.role === SOURCE_ASSISTANT ? `bot-${id}` : id),
     varintField(2, BigInt(item.role)),
     stringField(3, item.text || ""),
     item.toolCallId ? stringField(7, item.toolCallId) : Buffer.alloc(0),
@@ -182,7 +191,15 @@ function encodeTool(tool) {
     stringField(1, value?.name || "tool"),
     stringField(2, String(value?.description || "").slice(0, 6998)),
     stringField(3, JSON.stringify(value?.parameters || value?.input_schema || {}) || "{}"),
+    value?.strict === true ? varintField(12, 1n) : Buffer.alloc(0),
   ]);
+}
+
+// OpenAI tool_choice → ChatToolChoice: 1 = option name (auto/none/required), 2 = forced tool name.
+function encodeToolChoice(choice) {
+  if (choice === "auto" || choice === "none" || choice === "required") return stringField(1, choice);
+  const name = choice?.type === "function" ? choice.function?.name : undefined;
+  return typeof name === "string" && name ? stringField(2, name) : null;
 }
 
 function contentText(content) {
@@ -192,7 +209,9 @@ function contentText(content) {
 
 function decodeTool(payload) {
   const values = new Map(decodeFields(payload).filter((field) => field.wire === 2).map((field) => [field.number, fieldText(field.value)]));
-  return { type: "tool", id: values.get(1) || crypto.randomUUID(), name: values.get(2) || "tool", argumentsJson: values.get(3) || "" };
+  // Devin streams a tool call as a header frame (id + name) followed by
+  // argument-only continuation frames, so id/name stay undefined when absent.
+  return { type: "tool", id: values.get(1), name: values.get(2), argumentsJson: values.get(3) || "" };
 }
 
 function decodeUsage(payload) {
@@ -314,18 +333,24 @@ export class DevinExecutor extends BaseExecutor {
     const transformedBody = frameDevinConnect(buildDevinChatRequest({ model, body, apiKey: token, userJwt, sessionId: credentials?.rawHeaders?.["x-session-id"] }));
     const upstream = await fetchImpl(url, { method: "POST", headers, body: transformedBody, signal });
     if (!upstream.ok) return { response: upstream, url, headers, transformedBody };
-    return { response: this.transformToSSE(upstream, model), url, headers, transformedBody };
+    return { response: this.transformToSSE(upstream, model, { singleToolCall: body?.parallel_tool_calls === false }), url, headers, transformedBody };
   }
 
-  transformToSSE(upstream, model) {
+  // singleToolCall: the upstream ignores field 11 in practice, so honor
+  // parallel_tool_calls:false here by forwarding only the first tool call.
+  transformToSSE(upstream, model, { singleToolCall = false } = {}) {
     const responseId = `chatcmpl-devin-${Date.now()}`;
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
         let pending = Buffer.alloc(0);
-        let toolCall = null;
+        // OpenAI index per upstream call id; argument-only frames go to toolIndex.
+        const toolIndexes = new Map();
+        let toolIndex = -1;
         let usage = null;
         let stopReason = 0;
+        let upstreamError = null;
+        let sawTrailer = false;
         const emit = (value) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         try {
           const reader = upstream.body?.getReader();
@@ -336,23 +361,47 @@ export class DevinExecutor extends BaseExecutor {
             pending = complete.rest;
             for (const frame of complete.frames) {
               if (frame.trailer) {
-                const error = decodeDevinTrailer(frame.payload);
-                if (error) emit({ error: { message: error, type: "devin_error" } });
+                sawTrailer = true;
+                upstreamError = decodeDevinTrailer(frame.payload) || upstreamError;
                 continue;
               }
               for (const delta of decodeDevinChatDeltas(frame.payload)) {
                 if (delta.type === "text") emit(chunk(responseId, model, { content: delta.value }));
                 else if (delta.type === "thinking") emit(chunk(responseId, model, { reasoning_content: delta.value }));
                 else if (delta.type === "tool") {
-                  toolCall = delta;
-                  emit(chunk(responseId, model, { tool_calls: [{ index: 0, id: delta.id, type: "function", function: { name: delta.name, arguments: delta.argumentsJson } }] }));
+                  const known = delta.id ? toolIndexes.get(delta.id) : undefined;
+                  const opensCall = known === undefined && (delta.id || delta.name || toolIndex < 0);
+                  if (singleToolCall && (opensCall ? toolIndexes.size > 0 : (known ?? toolIndex) > 0)) {
+                    // Track extra calls so their argument frames are skipped too.
+                    if (opensCall) { toolIndex = toolIndexes.size; toolIndexes.set(delta.id || `call_${crypto.randomUUID()}`, toolIndex); }
+                    else if (known !== undefined) toolIndex = known;
+                    continue;
+                  }
+                  if (opensCall) {
+                    toolIndex = toolIndexes.size;
+                    const id = delta.id || `call_${crypto.randomUUID()}`;
+                    toolIndexes.set(id, toolIndex);
+                    emit(chunk(responseId, model, { tool_calls: [{ index: toolIndex, id, type: "function", function: { name: delta.name || "tool", arguments: delta.argumentsJson } }] }));
+                  } else {
+                    if (known !== undefined) toolIndex = known;
+                    if (delta.argumentsJson) emit(chunk(responseId, model, { tool_calls: [{ index: toolIndex, function: { arguments: delta.argumentsJson } }] }));
+                  }
                 } else if (delta.type === "usage") usage = delta;
                 else if (delta.type === "stop") stopReason = delta.reason;
               }
             }
             if (next.done) break;
           }
-          const finish = toolCall ? "tool_calls" : stopReason === 1 || stopReason === 3 ? "length" : "stop";
+          if (!upstreamError && (pending.length || !sawTrailer)) {
+            upstreamError = "Devin stream ended without a Connect end-stream frame";
+          }
+          if (upstreamError) {
+            // No success finish chunk: clients and combo fallback must see a failed turn.
+            emit({ error: { message: upstreamError, type: "devin_error" } });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            return;
+          }
+          const finish = mapFinishReason(stopReason, toolIndexes.size > 0);
           const final = chunk(responseId, model, {}, finish);
           if (usage) final.usage = { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output, cache_read_input_tokens: usage.cacheRead, cache_creation_input_tokens: usage.cacheWrite };
           emit(final);
@@ -367,6 +416,14 @@ export class DevinExecutor extends BaseExecutor {
     });
     return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
   }
+}
+
+// Stop reasons as observed on the Devin Desktop wire: 3 = max tokens, 10 = tool use, 11 = content filter.
+function mapFinishReason(stopReason, hasToolCalls) {
+  if (hasToolCalls || stopReason === 10) return "tool_calls";
+  if (stopReason === 3) return "length";
+  if (stopReason === 11) return "content_filter";
+  return "stop";
 }
 
 function chunk(id, model, delta, finishReason = null) {
